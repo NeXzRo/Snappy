@@ -1,262 +1,173 @@
 using System.IO.Compression;
 using Newtonsoft.Json.Linq;
 using Snappy.Common;
-using Snappy.Services.SnapshotManager;
+using Snappy.Features.Packaging;
 
 namespace Snappy.Features.Pcp;
 
-internal sealed class PcpImportService
+internal sealed class PcpExportService
 {
-    private readonly Configuration _configuration;
-    private readonly ISnapshotFileService _snapshotFileService;
-    private readonly Action _snapshotsUpdatedCallback;
-
-    public PcpImportService(Configuration configuration, ISnapshotFileService snapshotFileService,
-        Action snapshotsUpdatedCallback)
+    public async Task ExportPcp(
+        string snapshotPath,
+        string outputPath,
+        GlamourerHistoryEntry? selectedGlamourer,
+        CustomizeHistoryEntry? selectedCustomize,
+        string? playerNameOverride,
+        int? homeWorldIdOverride)
     {
-        _configuration = configuration;
-        _snapshotFileService = snapshotFileService;
-        _snapshotsUpdatedCallback = snapshotsUpdatedCallback;
-    }
-
-    public void ImportPcp(string filePath)
-    {
-        if (!SnapshotImportUtil.TryAcquireImportLock(out var importLease))
-        {
-            Notify.Info("Another snapshot import is already in progress.");
-            return;
-        }
-
-        string? snapshotPath = null;
+        string? temporaryOutput = null;
         try
         {
-            if (!File.Exists(filePath))
+            var paths = SnapshotPaths.From(snapshotPath);
+
+            var snapshotInfo = await JsonUtil.DeserializeStateAsync<SnapshotInfo>(paths.SnapshotFile);
+            if (snapshotInfo == null)
             {
-                Notify.Error($"PCP file not found: {filePath}");
+                Notify.Error("Failed to load snapshot info for PCP export");
                 return;
             }
 
-            using var archive = ZipFile.OpenRead(filePath);
+            var glamourerHistory = await JsonUtil.DeserializeStateAsync<GlamourerHistory>(paths.GlamourerHistoryFile) ??
+                                   new GlamourerHistory();
+            var customizeHistory = await JsonUtil.DeserializeStateAsync<CustomizeHistory>(paths.CustomizeHistoryFile) ??
+                                   new CustomizeHistory();
 
-            var metadata = ArchiveUtil.ReadJsonEntry<PcpMetadata>(archive, "meta.json", Notify.Error,
-                "Invalid PCP file: missing meta.json", "Failed to parse meta.json from PCP file.");
-            if (metadata == null) return;
+            var glamourerEntry = selectedGlamourer ?? glamourerHistory.Entries.LastOrDefault();
+            var fileMapId = glamourerEntry?.FileMapId ?? snapshotInfo.CurrentFileMapId;
+            var resolvedFileMap = FileMapUtil.ResolveFileMap(snapshotInfo, fileMapId);
+            var resolvedFileSwaps = FileMapUtil.ResolveFileSwaps(snapshotInfo, fileMapId);
+            foreach (var gamePath in resolvedFileSwaps.Keys)
+                resolvedFileMap.Remove(gamePath);
+            var resolvedManipulations = FileMapUtil.ResolveManipulation(snapshotInfo, fileMapId);
 
-            var characterData = ArchiveUtil.ReadJsonEntry<PcpCharacterData>(archive, "character.json", Notify.Error,
-                "Invalid PCP file: missing character.json", "Failed to parse character.json from PCP file.");
-            if (characterData == null) return;
+            var pcpOutputPath = Path.ChangeExtension(outputPath, ".pcp");
+            temporaryOutput = AtomicFileUtil.CreateTemporaryOutputPath(pcpOutputPath);
+            using (var archive = ZipFile.Open(temporaryOutput, ZipArchiveMode.Create))
+            {
+                var actorName = !string.IsNullOrWhiteSpace(playerNameOverride)
+                    ? playerNameOverride!
+                    : snapshotInfo.SourceActor;
+                if (string.IsNullOrWhiteSpace(actorName))
+                    actorName = Path.GetFileName(snapshotPath);
+                var actorHomeWorld = ResolveActorHomeWorld(homeWorldIdOverride ?? snapshotInfo.SourceWorldId);
 
-            var modData = ArchiveUtil.ReadJsonEntry<PcpModData>(archive, "default_mod.json", Notify.Error,
-                "Invalid PCP file: missing default_mod.json", "Failed to parse default_mod.json from PCP file.");
-            if (modData == null) return;
+                var snapshotName = Path.GetFileName(snapshotPath);
+                var meta = ModMetadataBuilder.BuildSnapshotMetadata(snapshotName);
+                ArchiveUtil.WriteJsonEntry(archive, "meta.json", meta);
 
-            snapshotPath = CreateSnapshotDirectory(metadata.Name);
-            var paths = SnapshotPaths.From(snapshotPath);
-            Directory.CreateDirectory(paths.FilesDirectory);
+                var characterData = new PcpCharacterData
+                {
+                    Version = 1,
+                    Actor = new PcpActor
+                    {
+                        Type = "Player",
+                        PlayerName = actorName,
+                        HomeWorld = actorHomeWorld
+                    },
+                    Mod = actorName,
+                    Collection = actorName,
+                    Time = DateTime.TryParse(snapshotInfo.LastUpdate, CultureInfo.InvariantCulture,
+                        DateTimeStyles.AdjustToUniversal | DateTimeStyles.AssumeUniversal, out var lastUpdateUtc)
+                        ? lastUpdateUtc
+                        : DateTime.UtcNow,
+                    Note = "Exported from Snappy"
+                };
 
-            var gamePathToHashMap = ExtractFiles(archive, paths.FilesDirectory, modData);
+                if (glamourerEntry != null)
+                    try
+                    {
+                        if (GlamourerDesignUtil.TryDecodeDesignJson(glamourerEntry.GlamourerString, out var designObj)
+                            && designObj != null)
+                        {
+                            characterData.Glamourer = new JObject
+                            {
+                                ["Version"] = 1,
+                                ["Design"] = designObj
+                            };
+                        }
+                        else
+                        {
+                            throw new InvalidDataException("Glamourer data was empty after decoding/decompression.");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        PluginLog.Warning(
+                            $"Failed to export Glamourer data to PCP for snapshot '{snapshotName}': {ex.Message}");
+                    }
 
-            var snapshotInfo = CreateSnapshotInfo(characterData, gamePathToHashMap, modData);
+                var customizeEntry = selectedCustomize ?? customizeHistory.Entries.LastOrDefault();
+                if (TryCreateCustomizePlusPcpData(customizeEntry, actorName, out var customizePlus))
+                    characterData.CustomizePlus = customizePlus;
 
-            var customizeHistory = new CustomizeHistory();
-            if (characterData.CustomizePlus != null)
-                customizeHistory = CreateCustomizeHistory(characterData);
-            var customizeData = customizeHistory.Entries.LastOrDefault()?.CustomizeData ?? string.Empty;
+                ArchiveUtil.WriteJsonEntry(archive, "character.json", characterData);
 
-            var glamourerHistory = new GlamourerHistory();
-            if (characterData.Glamourer != null)
-                glamourerHistory = CreateGlamourerHistory(characterData, snapshotInfo.CurrentFileMapId, customizeData);
+                var modData = new PcpModData
+                {
+                    Manipulations = ModPackageBuilder.BuildManipulations(resolvedManipulations),
+                    FileSwaps = new Dictionary<string, string>(resolvedFileSwaps, StringComparer.OrdinalIgnoreCase)
+                };
+                ModPackageBuilder.AddSnapshotFiles(archive, snapshotInfo, paths.FilesDirectory, modData.Files,
+                    resolvedFileMap);
+                ArchiveUtil.WriteJsonEntry(archive, "default_mod.json", modData);
+            }
 
-            _snapshotFileService.SaveSnapshotToDisk(paths.RootPath, snapshotInfo, glamourerHistory, customizeHistory);
-
-            snapshotPath = null;
-            _snapshotsUpdatedCallback();
-            Notify.Success($"Successfully imported PCP: {metadata.Name}");
+            AtomicFileUtil.Complete(temporaryOutput, pcpOutputPath);
+            temporaryOutput = null;
+            Notify.Success($"Successfully exported PCP: {pcpOutputPath}");
         }
         catch (Exception ex)
         {
-            if (snapshotPath != null)
-                RemoveIncompleteSnapshot(snapshotPath);
-
-            Notify.Error($"Failed during PCP import for file: {Path.GetFileName(filePath)}\n{ex.Message}");
-            PluginLog.Error($"Failed during PCP import for file: {Path.GetFileName(filePath)}: {ex}");
+            Notify.Error($"Failed during PCP export: {ex.Message}");
+            PluginLog.Error($"Failed during PCP export for '{snapshotPath}': {ex}");
         }
         finally
         {
-            importLease!.Dispose();
+            if (temporaryOutput != null)
+                AtomicFileUtil.TryDelete(temporaryOutput);
         }
     }
 
-    private string CreateSnapshotDirectory(string description)
+    private static int ResolveActorHomeWorld(int? worldId)
+        => worldId is > 0 and <= ushort.MaxValue ? worldId.Value : PcpActor.AnyWorld;
+
+    private static bool TryCreateCustomizePlusPcpData(CustomizeHistoryEntry? entry, string actorName,
+        out JObject? customizePlus)
     {
-        var snapshotDirName = SnapshotImportUtil.SanitizeDirectoryName(description, "PCP_Import");
-        return SnapshotImportUtil.CreateUniqueSnapshotDirectory(_configuration.WorkingDirectory, snapshotDirName);
-    }
+        customizePlus = null;
+        if (entry == null)
+            return false;
 
-    private static SnapshotInfo CreateSnapshotInfo(PcpCharacterData characterData,
-        Dictionary<string, string> gamePathToHashMap, PcpModData modData)
-    {
-        var manipulationString = string.Empty;
-        var manipulations = modData.Manipulations ?? [];
-        if (manipulations.Count > 0)
-            try
-            {
-                manipulationString = ConvertPcpManipulationsToPenumbraFormat(manipulations);
-            }
-            catch (Exception ex)
-            {
-                PluginLog.Warning($"Failed to process manipulations from PCP: {ex.Message}");
-            }
+        var profileJson = DecodeCustomizeData(entry.CustomizeData);
+        if (string.IsNullOrWhiteSpace(profileJson))
+            profileJson = CustomizePlusUtil.DecompressTemplateBase64(entry.CustomizeTemplate);
 
-        var actor = characterData.Actor ?? new PcpActor();
-        var sourceActor = string.IsNullOrWhiteSpace(actor.PlayerName) ? "PCP Import" : actor.PlayerName;
-        var sourceWorld = actor.HomeWorld is > 0 and < PcpActor.AnyWorld ? actor.HomeWorld : (int?)null;
-        return SnapshotImportUtil.BuildSnapshotInfo(sourceActor, sourceWorld, manipulationString, gamePathToHashMap,
-            GamePathUtil.NormalizeFileSwaps(modData.FileSwaps ?? new Dictionary<string, string>()));
-    }
-
-    private static string ConvertPcpManipulationsToPenumbraFormat(List<JObject> pcpManipulations)
-    {
-        // Penumbra manipulation v0 is Base64(GZip(version byte + JSON)).
-        var manipulationsJson = JsonConvert.SerializeObject(pcpManipulations);
-        var jsonBytes = Encoding.UTF8.GetBytes(manipulationsJson);
-
-        using var resultStream = new MemoryStream();
-        using (var gzipStream = new GZipStream(resultStream, CompressionMode.Compress))
+        if (!CustomizePlusUtil.TryCreateTemplateJson(profileJson, out var templateJson, $"PCP Template - {actorName}"))
         {
-            gzipStream.WriteByte(0);
-            gzipStream.Write(jsonBytes, 0, jsonBytes.Length);
+            PluginLog.Warning("Failed to convert Customize+ data to a PCP template.");
+            return false;
         }
 
-        return Convert.ToBase64String(resultStream.ToArray());
-    }
-
-    private static GlamourerHistory CreateGlamourerHistory(PcpCharacterData characterData, string? fileMapId,
-        string? customizeData)
-    {
-        var history = new GlamourerHistory();
-        if (characterData.Glamourer != null)
-            try
-            {
-                var glamourerObj = JObject.FromObject(characterData.Glamourer);
-
-                if (glamourerObj["Version"]?.ToObject<int>() == 1 && glamourerObj["Design"] is JObject designObj)
-                {
-                    if (GlamourerDesignUtil.TryEncodeDesignJson(designObj, out var designBase64))
-                        history.Entries.Add(GlamourerHistoryEntry.Create(designBase64, "Imported from PCP", fileMapId,
-                            customizeData));
-                    else
-                        PluginLog.Warning("Failed to encode Glamourer Design data from PCP.");
-                }
-                else
-                {
-                    PluginLog.Debug("PCP Glamourer data is not in V1 format, attempting to import as legacy data.");
-                    if (GlamourerDesignUtil.TryEncodeDesignJson(glamourerObj, out var designBase64))
-                        history.Entries.Add(GlamourerHistoryEntry.Create(designBase64,
-                            "Imported from PCP (Legacy Format)", fileMapId, customizeData));
-                    else
-                        PluginLog.Warning("Failed to encode Glamourer legacy data from PCP.");
-                }
-            }
-            catch (Exception ex)
-            {
-                PluginLog.Warning($"Failed to process Glamourer data from PCP: {ex.Message}");
-            }
-
-        return history;
-    }
-
-    private static CustomizeHistory CreateCustomizeHistory(PcpCharacterData characterData)
-    {
-        var history = new CustomizeHistory();
-        if (characterData.CustomizePlus != null)
-            try
-            {
-                var customizePlusObj = JObject.FromObject(characterData.CustomizePlus);
-                var source = customizePlusObj["Template"] ?? customizePlusObj;
-                if (!CustomizePlusUtil.TryNormalizeIpcProfileJson(source.ToString(Formatting.None), out var profileJson))
-                {
-                    PluginLog.Warning("Failed to convert Customize+ PCP data to an IPC profile.");
-                    return history;
-                }
-
-                var customizeBase64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(profileJson));
-                history.Entries.Add(CustomizeHistoryEntry.CreateFromBase64(customizeBase64, profileJson,
-                    customizePlusObj["Template"] == null ? "Imported from PCP (Legacy Format)" : "Imported from PCP"));
-            }
-            catch (Exception ex)
-            {
-                PluginLog.Warning($"Failed to process Customize+ data from PCP: {ex.Message}");
-            }
-
-        return history;
-    }
-
-    private static Dictionary<string, string> ExtractFiles(ZipArchive archive, string filesDir, PcpModData modData)
-    {
-        var gamePathToHashMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        var archivePathToHash = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-
-        foreach (var (rawGamePath, rawArchivePath) in modData.Files ?? [])
+        customizePlus = new JObject
         {
-            var gamePath = GamePathUtil.Normalize(rawGamePath);
-            if (string.IsNullOrWhiteSpace(gamePath))
-                throw new InvalidDataException($"PCP contains an invalid game path: '{rawGamePath}'.");
-
-            var archivePath = ArchiveUtil.NormalizeArchivePath(rawArchivePath);
-            if (string.IsNullOrWhiteSpace(archivePath))
-                throw new InvalidDataException($"PCP file path is empty for '{gamePath}'.");
-
-            if (!archivePathToHash.TryGetValue(archivePath, out var hash))
-            {
-                var entry = ArchiveUtil.FindEntry(archive, archivePath);
-                if (entry == null)
-                    throw new InvalidDataException(
-                        $"PCP archive entry '{rawArchivePath}' for '{gamePath}' is missing.");
-
-                hash = ExtractEntryToBlob(entry, filesDir, gamePath);
-                archivePathToHash[archivePath] = hash;
-            }
-
-            gamePathToHashMap[gamePath] = hash;
-        }
-
-        return gamePathToHashMap;
+            ["Template"] = JObject.Parse(templateJson)
+        };
+        return true;
     }
 
-    private static string ExtractEntryToBlob(ZipArchiveEntry entry, string filesDir, string gamePath)
+    private static string DecodeCustomizeData(string customizeData)
     {
-        var temporaryPath = Path.Combine(filesDir, $".{Guid.NewGuid():N}.tmp");
+        if (string.IsNullOrWhiteSpace(customizeData))
+            return string.Empty;
+
         try
         {
-            using (var entryStream = entry.Open())
-            using (var outputStream = File.Create(temporaryPath))
-                entryStream.CopyTo(outputStream);
-
-            var hash = PluginUtil.GetFileHash(temporaryPath);
-            var existingPath = SnapshotBlobUtil.FindAnyExistingBlobPath(filesDir, hash);
-            var outputPath = existingPath ?? SnapshotBlobUtil.GetPreferredBlobPath(filesDir, hash, gamePath);
-            if (!File.Exists(outputPath))
-                File.Move(temporaryPath, outputPath);
-
-            return hash;
+            return Encoding.UTF8.GetString(Convert.FromBase64String(customizeData));
         }
-        finally
+        catch (FormatException)
         {
-            AtomicFileUtil.TryDelete(temporaryPath);
+            return customizeData;
         }
     }
 
-    private static void RemoveIncompleteSnapshot(string snapshotPath)
-    {
-        try
-        {
-            if (Directory.Exists(snapshotPath))
-                Directory.Delete(snapshotPath, true);
-        }
-        catch (Exception cleanupException)
-        {
-            PluginLog.Warning($"Failed to remove incomplete PCP import '{snapshotPath}': {cleanupException.Message}");
-        }
-    }
 }

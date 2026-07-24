@@ -3,7 +3,7 @@
     "Author": "Eqbot, ViviAshe, astrodoobs, BeSlightly",
     "Name": "Snapper",
     "InternalName": "Snapper",
-    "AssemblyVersion": "0.5.2.6",
+    "AssemblyVersion": "0.5.2.7",
     "Description": "Want to export your character and mods exactly as-is in a single collection *without* Mare? This plugin saves and loads your character's current appearance, and allows you to share modded characters without relying on MCDF.",
     "RepoUrl": "https://github.com/NeXzRo/Snapper",
     "ApplicableVersion": "any",
